@@ -8,7 +8,7 @@ A Model Context Protocol (MCP) server built with FastMCP that interfaces with th
 
 - **Child Management**: List and manage multiple child profiles
 - **Sleep Tracking**: Start, pause, resume, complete, and cancel sleep sessions with automatic history tracking
-- **Feeding Tracking**: Track breastfeeding sessions with side switching
+- **Feeding Tracking**: Track breastfeeding sessions with side switching, log bottle feedings with amounts
 - **Diaper Logging**: Record diaper changes with type, amount, color, and consistency details
 - **Growth Tracking**: Log and retrieve weight, height, and head circumference measurements
 
@@ -250,7 +250,9 @@ Get feeding history for a child within a date range (defaults to last 7 days).
 
 **Important**: The `end_date` is exclusive. To get data for a single day (e.g., Jan 30), set `start_date='2026-01-30'` and `end_date='2026-01-31'`.
 
-**Example**: "Show me today's feedings"
+**Returns**: A list sorted by start time. Every entry has `start_time`, `mode` (`breast`, `bottle`, `solids`, or `unknown`), and `is_multi_entry`. Breast entries add `left_duration_minutes`, `right_duration_minutes`, and `total_duration_minutes`. Bottle entries add `amount` (may be `null` if logged without a volume), `units`, and `bottle_type`.
+
+**Example**: "Show me today's feedings" or "How many ounces did she drink yesterday?"
 
 ### Diaper Tracking
 

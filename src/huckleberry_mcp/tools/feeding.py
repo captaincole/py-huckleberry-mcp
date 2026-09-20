@@ -19,6 +19,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
+from google.cloud import firestore
 from ..auth import get_authenticated_api
 from .children import validate_child_uid
 from ..utils import iso_to_timestamp, iso_datetime_to_timestamp, timestamp_to_local_iso
@@ -549,13 +550,106 @@ async def cancel_feeding(child_uid: str) -> Dict[str, Any]:
 
 
 
+def _fetch_feed_intervals(
+    api,
+    child_uid: str,
+    start_timestamp: int,
+    end_timestamp: int
+) -> List[Dict[str, Any]]:
+    """
+    Read raw feed interval documents from Firestore for a date range.
+
+    The bundled huckleberry-api only surfaces breastfeeding durations from
+    intervals, dropping mode/amount/units/bottleType. This reads the same
+    collection directly so bottle feedings keep their fields.
+
+    Mirrors the library's two-query pattern:
+    - regular docs: filtered by top-level 'start' in Firestore
+    - multi-entry docs ('multi' == True): entries nested under 'data', filtered in Python
+
+    Returns raw dicts with an added 'is_multi_entry' flag.
+    """
+    intervals_ref = (
+        api._get_firestore_client()
+        .collection("feed")
+        .document(child_uid)
+        .collection("intervals")
+    )
+
+    regular_docs = (
+        intervals_ref
+        .where(filter=firestore.FieldFilter("start", ">=", start_timestamp))
+        .where(filter=firestore.FieldFilter("start", "<", end_timestamp))
+        .order_by("start")
+        .stream()
+    )
+    regular = [
+        {**data, "is_multi_entry": False}
+        for data in (doc.to_dict() for doc in regular_docs)
+        if data and not data.get("multi")
+    ]
+
+    multi_docs = intervals_ref.where(filter=firestore.FieldFilter("multi", "==", True)).stream()
+    multi = [
+        {**entry, "is_multi_entry": True}
+        for data in (doc.to_dict() for doc in multi_docs)
+        if data and isinstance(data.get("data"), dict)
+        for entry in data["data"].values()
+        if isinstance(entry, dict)
+        and "start" in entry
+        and start_timestamp <= entry["start"] < end_timestamp
+    ]
+
+    return sorted(regular + multi, key=lambda e: e["start"])
+
+
+def _format_feed_entry(raw: Dict[str, Any], user_timezone) -> Dict[str, Any]:
+    """
+    Convert a raw Firestore feed interval into the tool's output shape.
+
+    Mode-specific fields:
+    - breast: left/right/total duration in minutes
+    - bottle: amount (may be None if saved without a volume), units, bottle_type
+    - solids / unknown: base fields only
+    """
+    has_durations = "leftDuration" in raw or "rightDuration" in raw
+    mode = raw.get("mode") or ("breast" if has_durations else "unknown")
+
+    base = {
+        "start_time": timestamp_to_local_iso(raw["start"], user_timezone),
+        "mode": mode,
+        "is_multi_entry": raw.get("is_multi_entry", False),
+    }
+
+    if mode == "breast":
+        # Backend returns duration in seconds, convert to minutes
+        left_mins = raw.get("leftDuration", 0) // 60
+        right_mins = raw.get("rightDuration", 0) // 60
+        return {
+            **base,
+            "left_duration_minutes": left_mins,
+            "right_duration_minutes": right_mins,
+            "total_duration_minutes": left_mins + right_mins,
+        }
+
+    if mode == "bottle":
+        return {
+            **base,
+            "amount": raw.get("amount"),
+            "units": raw.get("units"),
+            "bottle_type": raw.get("bottleType"),
+        }
+
+    return base
+
+
 async def get_feeding_history(
     child_uid: str,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
-    Get feeding history for a child.
+    Get feeding history for a child, including bottle amounts.
 
     Args:
         child_uid: The child's unique identifier (from list_children)
@@ -563,11 +657,20 @@ async def get_feeding_history(
         end_date: End date in ISO format (YYYY-MM-DD), defaults to today
 
     Returns:
-        List of dicts, each containing:
+        List of dicts sorted by start time. Every entry has:
         - start_time (str): Feeding start time in local ISO format
-        - left_duration_minutes (int): Duration on left breast in minutes
-        - right_duration_minutes (int): Duration on right breast in minutes
+        - mode (str): "breast", "bottle", "solids", or "unknown"
         - is_multi_entry (bool): True if this was a batch-logged entry
+
+        Breast entries add:
+        - left_duration_minutes (int)
+        - right_duration_minutes (int)
+        - total_duration_minutes (int)
+
+        Bottle entries add:
+        - amount (float | None): Amount fed, None if logged without a volume
+        - units (str): "oz" or "ml"
+        - bottle_type (str): "Formula", "Breast Milk", "Mixed", etc.
 
     Raises:
         Exception: When API fails
@@ -590,26 +693,9 @@ async def get_feeding_history(
         else:
             end_timestamp = iso_to_timestamp(end_date, user_timezone)
 
-        # Use get_feed_intervals which returns list of dicts with 'start', 'leftDuration', 'rightDuration'
-        intervals = api.get_feed_intervals(child_uid, start_timestamp, end_timestamp)
+        intervals = _fetch_feed_intervals(api, child_uid, start_timestamp, end_timestamp)
 
-        result = []
-        for interval in intervals:
-            # Convert timestamp to ISO format in user's timezone
-            start_time = timestamp_to_local_iso(interval["start"], user_timezone)
-
-            # Backend returns duration in seconds, convert to minutes
-            left_mins = interval.get("leftDuration", 0) // 60
-            right_mins = interval.get("rightDuration", 0) // 60
-
-            result.append({
-                "start_time": start_time,
-                "left_duration_minutes": left_mins,
-                "right_duration_minutes": right_mins,
-                "is_multi_entry": interval.get("is_multi_entry", False),
-            })
-
-        return result
+        return [_format_feed_entry(raw, user_timezone) for raw in intervals]
 
     except Exception as e:
         raise Exception(f"Failed to get feeding history: {str(e)}")
